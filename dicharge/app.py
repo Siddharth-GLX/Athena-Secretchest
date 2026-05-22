@@ -447,3 +447,4 @@ if process_button:
 
 else:
     st.warning("Click **Process File** from the sidebar after uploading the Excel file.")
+    
