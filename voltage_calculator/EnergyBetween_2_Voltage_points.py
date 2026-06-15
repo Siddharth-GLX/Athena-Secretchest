@@ -1,6 +1,5 @@
 import pandas as pd
 from pathlib import Path
-
 BASE_DIR = Path(__file__).parent
 
 FILE = BASE_DIR / "EPS_Capacity_Test_Processed_1.2V.xlsx"
@@ -17,9 +16,7 @@ POINT_B_VOLTAGE = 24.0
 VOLTAGE_OFFSET_V = 0.0
 
 
-# ============================================================
 # LOAD EXCEL DATA
-# ============================================================
 
 def load_excel_data(file_path, sheet_name=None):
     """
@@ -77,9 +74,7 @@ def load_excel_data(file_path, sheet_name=None):
 
     df["VOLTAGE_USED_FOR_CALCULATION"] = df[voltage_col] + VOLTAGE_OFFSET_V
 
-    # --------------------------------------------------------
-    # Time handling
-    # --------------------------------------------------------
+        # Time handling
 
     if "TIMESTAMP" in df.columns:
         df["TIMESTAMP"] = pd.to_numeric(df["TIMESTAMP"], errors="coerce")
@@ -262,9 +257,7 @@ def load_excel_data(file_path, sheet_name=None):
     return df, voltage_col
 
 
-# ============================================================
 # FIND VOLTAGE POINTS DURING DISCHARGE
-# ============================================================
 
 def find_voltage_index_for_discharge(df, target_voltage):
     """
