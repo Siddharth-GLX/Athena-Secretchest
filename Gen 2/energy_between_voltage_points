@@ -1,0 +1,406 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+
+# ============================================================
+# DEFAULT SETTINGS
+# ============================================================
+
+DEFAULT_FILE = "EPS Charge Discharge Test.xlsx"
+DEFAULT_SHEET_NAME = "Discharging"
+
+DEFAULT_TIMESTAMP_COL = "TIMESTAMP"
+DEFAULT_VOLTAGE_COL = "TOTAL_BATTERY_VOLTAGE"
+DEFAULT_CURRENT_COL = "DISCHARGE_CURRENT"
+
+DEFAULT_PACK_NOMINAL_ENERGY_WH = 1296.0
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def ask_with_default(prompt, default_value):
+    """
+    Ask user for input. If user presses Enter, use default value.
+    """
+    user_input = input(f"{prompt} [{default_value}]: ").strip()
+
+    if user_input == "":
+        return default_value
+
+    return user_input
+
+
+def ask_float(prompt, default_value=None):
+    """
+    Ask user for a floating-point number.
+    """
+    while True:
+        if default_value is None:
+            user_input = input(f"{prompt}: ").strip()
+        else:
+            user_input = input(f"{prompt} [{default_value}]: ").strip()
+
+        if user_input == "" and default_value is not None:
+            return float(default_value)
+
+        try:
+            return float(user_input)
+        except ValueError:
+            print("Invalid number. Please enter a valid value.")
+
+
+def ask_yes_no(prompt, default="y"):
+    """
+    Ask user a yes/no question.
+    """
+    while True:
+        user_input = input(f"{prompt} [{default}]: ").strip().lower()
+
+        if user_input == "":
+            user_input = default.lower()
+
+        if user_input in ["y", "yes"]:
+            return True
+
+        if user_input in ["n", "no"]:
+            return False
+
+        print("Please enter y or n.")
+
+
+# ============================================================
+# DATA PROCESSING
+# ============================================================
+
+def load_and_process_excel(
+    file_path,
+    sheet_name,
+    timestamp_col,
+    voltage_col,
+    current_col,
+):
+    """
+    Loads Excel discharge data and calculates cumulative discharged energy.
+
+    Required columns:
+    - TIMESTAMP in Unix seconds
+    - TOTAL_BATTERY_VOLTAGE in V
+    - DISCHARGE_CURRENT in A
+    """
+
+    file_path = Path(file_path)
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+    df = df.copy()
+    df.columns = [str(col).strip() for col in df.columns]
+
+    required_cols = [timestamp_col, voltage_col, current_col]
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns: {missing_cols}\n"
+            f"Available columns are: {list(df.columns)}"
+        )
+
+    df = df[[timestamp_col, voltage_col, current_col]].copy()
+
+    df[timestamp_col] = pd.to_numeric(df[timestamp_col], errors="coerce")
+    df[voltage_col] = pd.to_numeric(df[voltage_col], errors="coerce")
+    df[current_col] = pd.to_numeric(df[current_col], errors="coerce")
+
+    df = df.dropna(subset=[timestamp_col, voltage_col, current_col])
+    df = df.sort_values(timestamp_col).reset_index(drop=True)
+
+    if len(df) < 2:
+        raise ValueError("Not enough valid rows. At least two rows are required.")
+
+    # Time difference between samples
+    df["dt_sec"] = df[timestamp_col].diff().fillna(0)
+
+    # Safety: remove negative time jumps
+    df.loc[df["dt_sec"] < 0, "dt_sec"] = 0
+
+    # Use absolute current because discharge current can be negative
+    df["Current_abs_A"] = df[current_col].abs()
+
+    # Power = Voltage x Current
+    df["Power_W"] = df[voltage_col] * df["Current_abs_A"]
+
+    # Incremental energy in Wh
+    df["d_Wh"] = df["Power_W"] * df["dt_sec"] / 3600.0
+
+    # Cumulative discharged energy
+    df["Energy_Discharged_Wh"] = df["d_Wh"].cumsum()
+
+    # Capacity
+    df["d_Ah"] = df["Current_abs_A"] * df["dt_sec"] / 3600.0
+    df["Capacity_Ah"] = df["d_Ah"].cumsum()
+    df["Capacity_mAh"] = df["Capacity_Ah"] * 1000.0
+
+    return df
+
+
+def create_voltage_energy_curve(
+    df,
+    voltage_col,
+    scale_to_pack_energy,
+    pack_nominal_energy_wh,
+):
+    """
+    Creates a voltage-to-energy lookup curve.
+
+    If scale_to_pack_energy = True:
+        The measured curve is scaled to the full pack energy, e.g. 1296 Wh.
+
+    If scale_to_pack_energy = False:
+        The script uses the measured dataset energy directly.
+    """
+
+    curve = df[[voltage_col, "Energy_Discharged_Wh"]].copy()
+    curve = curve.dropna()
+
+    measured_total_energy_wh = curve["Energy_Discharged_Wh"].max()
+
+    if measured_total_energy_wh <= 0:
+        raise ValueError("Measured discharge energy is zero or negative.")
+
+    if scale_to_pack_energy:
+        curve["Energy_Used_For_Calculation_Wh"] = (
+            curve["Energy_Discharged_Wh"] / measured_total_energy_wh
+        ) * pack_nominal_energy_wh
+    else:
+        curve["Energy_Used_For_Calculation_Wh"] = curve["Energy_Discharged_Wh"]
+
+    # For interpolation, voltage must be increasing.
+    # Since discharge voltage normally decreases with time, we sort by voltage.
+    curve = curve.sort_values(voltage_col).reset_index(drop=True)
+
+    # If duplicate voltage values exist, combine them.
+    # Median is used to reduce effect of noise.
+    curve = (
+        curve.groupby(voltage_col, as_index=False)
+        .median(numeric_only=True)
+        .sort_values(voltage_col)
+        .reset_index(drop=True)
+    )
+
+    return curve, measured_total_energy_wh
+
+
+def find_energy_at_voltage(curve, voltage_col, voltage_point):
+    """
+    Interpolates energy at a given voltage point.
+    """
+
+    min_voltage = curve[voltage_col].min()
+    max_voltage = curve[voltage_col].max()
+
+    if voltage_point < min_voltage or voltage_point > max_voltage:
+        raise ValueError(
+            f"Voltage {voltage_point:.3f} V is outside the dataset range.\n"
+            f"Available voltage range: {min_voltage:.3f} V to {max_voltage:.3f} V"
+        )
+
+    energy_at_voltage = np.interp(
+        voltage_point,
+        curve[voltage_col],
+        curve["Energy_Used_For_Calculation_Wh"],
+    )
+
+    return energy_at_voltage
+
+
+def save_results(
+    output_file,
+    processed_df,
+    curve_df,
+    result_dict,
+):
+    """
+    Saves processed data and result to Excel.
+    """
+
+    result_df = pd.DataFrame(
+        list(result_dict.items()),
+        columns=["Parameter", "Value"],
+    )
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        result_df.to_excel(writer, sheet_name="Result", index=False)
+        processed_df.to_excel(writer, sheet_name="Processed_Data", index=False)
+        curve_df.to_excel(writer, sheet_name="Voltage_Energy_Curve", index=False)
+
+    return output_file
+
+
+# ============================================================
+# MAIN PROGRAM
+# ============================================================
+
+def main():
+    print()
+    print("ENERGY BETWEEN TWO BATTERY VOLTAGE POINTS")
+    print()
+
+    file_path = ask_with_default("Enter Excel file name/path", DEFAULT_FILE)
+    sheet_name = ask_with_default("Enter sheet name", DEFAULT_SHEET_NAME)
+
+    timestamp_col = ask_with_default("Enter timestamp column name", DEFAULT_TIMESTAMP_COL)
+    voltage_col = ask_with_default("Enter voltage column name", DEFAULT_VOLTAGE_COL)
+    current_col = ask_with_default("Enter current column name", DEFAULT_CURRENT_COL)
+
+    print()
+    print("Now enter the two battery pack voltage points.")
+    print("Example for 8S pack: 31.5 and 28.0")
+    print()
+
+    voltage_1 = ask_float("Enter voltage point 1 in V")
+    voltage_2 = ask_float("Enter voltage point 2 in V")
+
+    print()
+    scale_to_pack_energy = ask_yes_no(
+        "Scale measured discharge curve to full assumed pack energy?",
+        default="y",
+    )
+
+    if scale_to_pack_energy:
+        pack_nominal_energy_wh = ask_float(
+            "Enter assumed pack nominal energy in Wh",
+            DEFAULT_PACK_NOMINAL_ENERGY_WH,
+        )
+    else:
+        pack_nominal_energy_wh = None
+
+    print()
+    print("Processing...")
+
+    processed_df = load_and_process_excel(
+        file_path=file_path,
+        sheet_name=sheet_name,
+        timestamp_col=timestamp_col,
+        voltage_col=voltage_col,
+        current_col=current_col,
+    )
+
+    curve_df, measured_total_energy_wh = create_voltage_energy_curve(
+        df=processed_df,
+        voltage_col=voltage_col,
+        scale_to_pack_energy=scale_to_pack_energy,
+        pack_nominal_energy_wh=pack_nominal_energy_wh if pack_nominal_energy_wh else measured_total_energy_wh,
+    )
+
+    energy_at_v1 = find_energy_at_voltage(
+        curve=curve_df,
+        voltage_col=voltage_col,
+        voltage_point=voltage_1,
+    )
+
+    energy_at_v2 = find_energy_at_voltage(
+        curve=curve_df,
+        voltage_col=voltage_col,
+        voltage_point=voltage_2,
+    )
+
+    energy_difference_wh = abs(energy_at_v2 - energy_at_v1)
+
+    higher_voltage = max(voltage_1, voltage_2)
+    lower_voltage = min(voltage_1, voltage_2)
+
+    energy_at_higher_voltage = find_energy_at_voltage(
+        curve=curve_df,
+        voltage_col=voltage_col,
+        voltage_point=higher_voltage,
+    )
+
+    energy_at_lower_voltage = find_energy_at_voltage(
+        curve=curve_df,
+        voltage_col=voltage_col,
+        voltage_point=lower_voltage,
+    )
+
+    energy_from_high_to_low_wh = abs(
+        energy_at_lower_voltage - energy_at_higher_voltage
+    )
+
+    if scale_to_pack_energy:
+        energy_basis = pack_nominal_energy_wh
+        remaining_energy_at_v1 = energy_basis - energy_at_v1
+        remaining_energy_at_v2 = energy_basis - energy_at_v2
+    else:
+        energy_basis = measured_total_energy_wh
+        remaining_energy_at_v1 = energy_basis - energy_at_v1
+        remaining_energy_at_v2 = energy_basis - energy_at_v2
+
+    result = {
+        "Voltage point 1 V": voltage_1,
+        "Voltage point 2 V": voltage_2,
+        "Energy at voltage point 1 Wh": energy_at_v1,
+        "Energy at voltage point 2 Wh": energy_at_v2,
+        "Energy difference between points Wh": energy_difference_wh,
+        "Higher voltage V": higher_voltage,
+        "Lower voltage V": lower_voltage,
+        "Energy from higher voltage to lower voltage Wh": energy_from_high_to_low_wh,
+        "Measured total dataset energy Wh": measured_total_energy_wh,
+        "Scale measured curve to pack energy": scale_to_pack_energy,
+        "Energy basis used Wh": energy_basis,
+        "Remaining energy at voltage point 1 Wh": remaining_energy_at_v1,
+        "Remaining energy at voltage point 2 Wh": remaining_energy_at_v2,
+    }
+
+    output_file = "Energy_Between_Voltage_Points_Result.xlsx"
+
+    save_results(
+        output_file=output_file,
+        processed_df=processed_df,
+        curve_df=curve_df,
+        result_dict=result,
+    )
+
+    print()
+    print("RESULT")
+    print()
+
+    print(f"Voltage point 1                  : {voltage_1:.3f} V")
+    print(f"Voltage point 2                  : {voltage_2:.3f} V")
+    print()
+
+    print(f"Energy at voltage point 1         : {energy_at_v1:.3f} Wh")
+    print(f"Energy at voltage point 2         : {energy_at_v2:.3f} Wh")
+    print()
+
+    print(f"Energy difference between points  : {energy_difference_wh:.3f} Wh")
+    print()
+
+    print("Discharge direction result")
+    print(f"Higher voltage point              : {higher_voltage:.3f} V")
+    print(f"Lower voltage point               : {lower_voltage:.3f} V")
+    print(f"Energy from higher to lower point : {energy_from_high_to_low_wh:.3f} Wh")
+    print()
+
+    print("Remaining energy")
+    print(f"Remaining energy at voltage 1     : {remaining_energy_at_v1:.3f} Wh")
+    print(f"Remaining energy at voltage 2     : {remaining_energy_at_v2:.3f} Wh")
+    print()
+
+    print("Dataset")
+    print(f"Measured total dataset energy     : {measured_total_energy_wh:.3f} Wh")
+    print(f"Scaling used                      : {scale_to_pack_energy}")
+    print(f"Energy basis used                 : {energy_basis:.3f} Wh")
+    print()
+
+    print(f"Saved Excel result file           : {output_file}")
+    print()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
